@@ -460,9 +460,9 @@ class ReolinkAPI:
         current = start
         stop_position = start
         reason = "duration-limit"
-        if not await self.ptz_control(username, password, op, speed, channel):
-            raise RuntimeError(f"NVR PTZ {op} rejected on channel {channel}")
         try:
+            if not await self.ptz_control(username, password, op, speed, channel):
+                raise RuntimeError(f"NVR PTZ {op} rejected on channel {channel}")
             deadline = time.monotonic() + duration_limit
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
