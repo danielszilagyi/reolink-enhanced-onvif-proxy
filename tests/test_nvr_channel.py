@@ -268,3 +268,30 @@ def test_timed_pulse_invalid_config_rejected(tmp_path):
 """)
     with pytest.raises(ValueError, match="nvr_pulse_ms"):
         load_config(cfg)
+
+
+def test_nvr_invalid_zoom_retains_last_valid_position():
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    host = AsyncMock()
+    host.zoom_range.return_value = {
+        "zoom": {"min": 0, "max": 27, "pos": -1},
+        "focus": {"min": 0, "max": 255, "pos": 0},
+    }
+    host.send.return_value = [{
+        "code": 0,
+        "value": {"ZoomFocus": {"zoom": {"pos": 11}, "focus": {"pos": 0}}},
+    }]
+    api._api = host
+    api._logged_in = True
+
+    first = run(api.get_zoom_focus("admin", "password", channel=8))
+    assert first.zoom_pos == 11
+    host.get_states.assert_not_awaited()
+
+    host.send.return_value = [{
+        "code": 0,
+        "value": {"ZoomFocus": {"zoom": {"pos": -1}, "focus": {"pos": 0}}},
+    }]
+    second = run(api.get_zoom_focus("admin", "password", channel=8))
+    assert second.zoom_pos == 11
+    assert api._last_valid_zoom[8] == 11
