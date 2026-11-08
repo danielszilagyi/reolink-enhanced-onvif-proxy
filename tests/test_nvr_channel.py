@@ -295,3 +295,25 @@ def test_nvr_invalid_zoom_retains_last_valid_position():
     second = run(api.get_zoom_focus("admin", "password", channel=8))
     assert second.zoom_pos == 11
     assert api._last_valid_zoom[8] == 11
+
+
+def test_feedback_nvr_reports_rejected_stop():
+    import pytest
+    from unittest.mock import patch
+
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    api._axis_position = AsyncMock(return_value=100)
+    api.ptz_control = AsyncMock(side_effect=[True, False])
+
+    async def instant_sleep(_seconds):
+        return None
+
+    with patch("reolink_onvif_proxy.reolink_api.asyncio.sleep", new=instant_sleep):
+        with pytest.raises(RuntimeError, match="PTZ Stop rejected"):
+            run(api._move_axis(
+                "admin", "password", "pan", ("Right", "Left"),
+                distance=30, tolerance=2, move_speed=3, channel=8,
+            ))
+    assert [call.args[2] for call in api.ptz_control.await_args_list] == [
+        "Right", "Stop"
+    ]
