@@ -86,6 +86,29 @@ pip install .
 reolink-onvif-proxy -c config.yml
 ```
 
+## Reolink NVR channels
+
+For a camera connected through a Reolink NVR, set `host` to the NVR IP and
+`channel` to its **zero-based** API channel. Each camera needs its own
+`listen_port`. Leave `channel` unset for direct-camera connections.
+
+```yaml
+cameras:
+  - name: fatarolo
+    host: 192.168.1.20  # RLN36 NVR IP
+    port: 80
+    channel: 8           # Corresponds to Preview_09_main
+    listen_port: 8001
+    username: admin
+    password: your_password
+```
+
+The NVR-specific PTZ position request uses `param.PtzCurPos.channel`.
+Some NVRs report pan (`Ppos`) without tilt (`Tpos`), limiting the
+position-feedback fallback. `Set3DPos` availability must be verified on your
+specific NVR and camera before relying on Frigate autotracking.
+RTSP video can continue to come from the NVR unchanged.
+
 ## Frigate Configuration
 
 Point each camera's ONVIF config at the proxy instead of the camera:
