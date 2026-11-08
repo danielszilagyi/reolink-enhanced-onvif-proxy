@@ -147,3 +147,63 @@ def test_nvr_lead_is_capped_to_prevent_premature_stop():
     assert api._axis_position.await_count >= 4
     commands = [call.args[2] for call in api.ptz_control.await_args_list]
     assert commands == ["Right", "Stop"]
+
+
+def test_queued_nvr_relative_moves_both_complete_in_order():
+    from reolink_onvif_proxy.onvif_server import ONVIFServer
+
+    async def scenario():
+        api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+        server = ONVIFServer(CameraConfig(name="nvr", host="192.0.2.20"), api)
+        began = asyncio.Event()
+        release = asyncio.Event()
+        completed = []
+
+        async def first():
+            began.set()
+            await release.wait()
+            completed.append("first")
+
+        async def second():
+            completed.append("second")
+
+        server._queue_action(lambda: first())
+        await began.wait()
+        server._queue_action(lambda: second())
+        assert not completed
+        assert server.state.busy
+        release.set()
+        await server._action_task
+        await asyncio.sleep(0)
+        assert completed == ["first", "second"]
+        assert not server.state.busy
+
+    run(scenario())
+
+
+def test_stop_cancels_active_and_queued_nvr_moves():
+    from reolink_onvif_proxy.onvif_server import ONVIFServer
+
+    async def scenario():
+        api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+        server = ONVIFServer(CameraConfig(name="nvr", host="192.0.2.20"), api)
+        began = asyncio.Event()
+        completed = []
+
+        async def first():
+            began.set()
+            await asyncio.Event().wait()
+
+        async def second():
+            completed.append("unexpected")
+
+        server._queue_action(lambda: first())
+        await began.wait()
+        server._queue_action(lambda: second())
+        tasks = tuple(server._action_tasks)
+        server._cancel_action()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert not completed
+        assert not server.state.busy
+
+    run(scenario())
