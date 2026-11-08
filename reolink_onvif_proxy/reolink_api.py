@@ -460,6 +460,7 @@ class ReolinkAPI:
         current = start
         stop_position = start
         reason = "duration-limit"
+        feedback_latency = 0.0
         try:
             if not await self.ptz_control(username, password, op, speed, channel):
                 raise RuntimeError(f"NVR PTZ {op} rejected on channel {channel}")
@@ -469,10 +470,12 @@ class ReolinkAPI:
                 if remaining <= 0:
                     break
                 try:
+                    query_started = time.monotonic()
                     current = await asyncio.wait_for(
                         self._axis_position(username, password, axis, channel),
                         timeout=min(0.7, remaining),
                     )
+                    feedback_latency = time.monotonic() - query_started
                 except asyncio.TimeoutError:
                     reason = "feedback-timeout"
                     break
@@ -524,9 +527,9 @@ class ReolinkAPI:
         logger.info(
             "Camera %s: NVR %s %s start=%d stopped=%d final=%d "
             "requested=%.1f actual=%d error=%.1f coast=%d elapsed=%.2fs "
-            "reason=%s learned_rate=%.1f learned_coast=%.1f",
+            "reason=%s feedback_latency=%.3fs learned_rate=%.1f learned_coast=%.1f",
             self.host, axis, op, start, stop_position, final, distance,
-            actual, distance - actual, coast, elapsed, reason,
+            actual, distance - actual, coast, elapsed, reason, feedback_latency,
             self._nvr_rate.get(axis, 0.0), self._nvr_coast.get(axis, 0.0),
         )
         if not actual:
