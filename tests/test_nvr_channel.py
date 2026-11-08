@@ -207,3 +207,61 @@ def test_stop_cancels_active_and_queued_nvr_moves():
         assert not server.state.busy
 
     run(scenario())
+
+
+def test_timed_nvr_pulse_stops_before_sampling_position():
+    from unittest.mock import patch
+
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    operations = []
+    readings = iter([2500] + [2520] * 12)
+
+    async def position(*_args):
+        operations.append("read")
+        return next(readings)
+
+    async def control(_user, _password, op, speed=0, channel=0):
+        operations.append(op)
+        return True
+
+    async def quick_sleep(_seconds):
+        return None
+
+    api._axis_position = AsyncMock(side_effect=position)
+    api.ptz_control = AsyncMock(side_effect=control)
+    with patch("reolink_onvif_proxy.reolink_api.asyncio.sleep", new=quick_sleep):
+        run(api._move_axis_timed(
+            "admin", "password", "pan", "Right",
+            distance=40, move_speed=3, channel=8, pulse_ms=120,
+        ))
+
+    assert operations[:3] == ["read", "Right", "Stop"]
+    assert operations.count("read") == 13
+
+
+def test_timed_pulse_is_opt_in_and_routes_relative_move():
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    api._move_axis_timed = AsyncMock()
+    api._move_axis = AsyncMock()
+    result = run(api.relative_move_feedback(
+        "admin", "password", pan=0.5, tilt=0.0,
+        pan_units=390, tilt_units=260, move_speed=3, channel=8,
+        nvr_pulse_ms=120,
+    ))
+    assert result
+    api._move_axis_timed.assert_awaited_once()
+    api._move_axis.assert_not_awaited()
+
+
+def test_timed_pulse_invalid_config_rejected(tmp_path):
+    import pytest
+    from reolink_onvif_proxy.config import load_config
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "cameras:\\n  - name: test\\n    host: 192.0.2.20\\n"
+        "    channel: 8\\n    listen_port: 8001\\n"
+        "    nvr_move_mode: timed_pulse\\n    nvr_pulse_ms: 10\\n"
+    )
+    with pytest.raises(ValueError, match="nvr_pulse_ms"):
+        load_config(cfg)
