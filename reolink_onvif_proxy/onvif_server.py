@@ -304,7 +304,7 @@ class ONVIFServer:
             )
 
         elif action == "ContinuousMove":
-            self._cancel_action()
+            self._cancel_action(reason="ContinuousMove")
             await self._handle_continuous_move(body, username, password)
             return responses.simple_response("tptz", "ContinuousMove")
 
@@ -313,18 +313,18 @@ class ONVIFServer:
             return responses.simple_response("tptz", "RelativeMove")
 
         elif action == "AbsoluteMove":
-            self._cancel_action()
+            self._cancel_action(reason="AbsoluteMove")
             await self._handle_absolute_move(body, username, password)
             return responses.simple_response("tptz", "AbsoluteMove")
 
         elif action == "Stop":
-            self._cancel_action()
+            self._cancel_action(reason="ONVIF Stop")
             await self.api.ptz_control(username, password, "Stop", channel=self.config.channel or 0)
             self.state.move_status = self.state.move_status.IDLE
             return responses.simple_response("tptz", "Stop")
 
         elif action == "GotoPreset":
-            self._cancel_action()
+            self._cancel_action(reason="GotoPreset")
             await self._handle_goto_preset(body, username, password)
             return responses.simple_response("tptz", "GotoPreset")
 
@@ -530,11 +530,12 @@ class ONVIFServer:
         return zf
 
     def _start_action(self, coro):
-        self._cancel_action()
+        self._cancel_action(reason="new standalone action")
         self.state.begin_action()
         task = asyncio.create_task(coro)
         self._action_task = task
         self._action_tasks.add(task)
+        logger.info("Camera %s: PTZ action started task=%s", self.config.name, task.get_name())
         task.add_done_callback(self._action_done)
 
     def _queue_action(self, coro_factory):
@@ -545,14 +546,19 @@ class ONVIFServer:
             return
 
         async def run_after_previous():
+            logger.info("Camera %s: queued RelativeMove waiting for task=%s",
+                        self.config.name, previous.get_name())
             try:
                 await previous
             except asyncio.CancelledError:
+                logger.warning("Camera %s: queued RelativeMove aborted: prior task cancelled",
+                               self.config.name)
                 raise
             except Exception:
-                # The previous move is already logged by its done callback;
-                # still execute the user's next move.
+                # Previous exception is logged by its task's done callback.
                 pass
+            logger.info("Camera %s: queued RelativeMove starting after task=%s",
+                        self.config.name, previous.get_name())
             await coro_factory()
 
         logger.info("Camera %s: queueing RelativeMove until current move finishes",
@@ -565,18 +571,27 @@ class ONVIFServer:
 
     def _action_done(self, task: asyncio.Task):
         self._action_tasks.discard(task)
+        if task.cancelled():
+            logger.warning("Camera %s: PTZ action cancelled task=%s",
+                           self.config.name, task.get_name())
+        elif task.exception() is not None:
+            logger.error("Camera %s: move failed: %s",
+                         self.config.name, task.exception())
+        else:
+            logger.info("Camera %s: PTZ action completed task=%s",
+                        self.config.name, task.get_name())
         if self._action_task is task:
             self._action_task = None
             if not self._action_tasks:
                 self.state.end_action()
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Camera %s: move failed: %s", self.config.name, task.exception())
 
-    def _cancel_action(self):
-        # Cancel queued moves as well as the currently executing command.
-        for task in tuple(self._action_tasks):
-            if not task.done():
-                task.cancel()
+    def _cancel_action(self, reason: str = "unspecified"):
+        pending = tuple(task for task in self._action_tasks if not task.done())
+        if pending:
+            logger.warning("Camera %s: cancelling %d PTZ action(s), reason=%s",
+                           self.config.name, len(pending), reason)
+        for task in pending:
+            task.cancel()
         self._action_tasks.clear()
         self._action_task = None
         self.state.busy = False
