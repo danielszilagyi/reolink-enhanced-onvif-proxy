@@ -597,19 +597,44 @@ class ReolinkAPI:
                 break  # smallest possible nudge would land further off
             segment_start = current
 
+            command_start = time.monotonic()
             if not await self.ptz_control(username, password, op, speed, channel):
                 raise RuntimeError(f"PTZ {op} rejected on channel {channel}")
+            started_at = time.monotonic()
+            reason = "timeout"
+            polls = 0
+            stop_ok = False
+            stop_ms = 0.0
             try:
-                deadline = time.monotonic() + 2.0
+                deadline = started_at + 2.0
                 while time.monotonic() < deadline:
                     await asyncio.sleep(0.05)
                     current = await self._axis_position(username, password, axis, channel)
+                    polls += 1
                     if abs(current - segment_start) >= target:
+                        reason = "target"
                         break
             finally:
-                await asyncio.shield(self.ptz_control(
+                stop_started = time.monotonic()
+                # Explicitly verify the response: a failed Stop must not be
+                # reported as a successful RelativeMove.
+                stop_ok = await asyncio.shield(self.ptz_control(
                     username, password, "Stop", channel=channel
                 ))
+                stop_ms = (time.monotonic() - stop_started) * 1000
+                logger.info(
+                    "Camera %s: NVR %s %s stop_ack=%s reason=%s "
+                    "start_ack_ms=%.0f motor_ms=%.0f stop_ms=%.0f polls=%d "
+                    "position_at_stop=%d target=%.1f",
+                    self.host, axis, op, stop_ok, reason,
+                    (started_at - command_start) * 1000,
+                    (stop_started - started_at) * 1000,
+                    stop_ms, polls, current, target,
+                )
+            if not stop_ok:
+                raise RuntimeError(
+                    f"PTZ Stop rejected for {axis} {op} on channel {channel}"
+                )
             if current == segment_start:
                 raise RuntimeError(f"No {axis} movement feedback on channel {channel}")
             stopped_at = current
