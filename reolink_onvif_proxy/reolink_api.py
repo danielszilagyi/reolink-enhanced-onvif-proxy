@@ -51,6 +51,7 @@ class ReolinkAPI:
         self._lead: dict[str, float] = {}  # axis -> overshoot past the stop point
         self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
         self._last_valid_zoom: dict[int, int] = {}  # ignore transient invalid NVR readings
+        self._last_invalid_zoom_response: dict[int, str] = {}
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -154,6 +155,15 @@ class ReolinkAPI:
                 )
                 if result and result[0].get("code") == 0:
                     value = result[0]["value"]["ZoomFocus"]
+                    if self.nvr_mode:
+                        response_zoom = value.get("zoom", {}).get("pos")
+                        if not isinstance(response_zoom, (int, float)) or response_zoom < 0:
+                            signature = repr(result[0])
+                            if self._last_invalid_zoom_response.get(channel) != signature:
+                                logger.warning("Camera %s NVR channel %d: raw invalid GetZoomFocus response: %s", self.host, channel, signature)
+                                self._last_invalid_zoom_response[channel] = signature
+                        else:
+                            self._last_invalid_zoom_response.pop(channel, None)
                     zoom["pos"] = value.get("zoom", {}).get("pos", zoom.get("pos", 0))
                     focus["pos"] = value.get("focus", {}).get("pos", focus.get("pos", 0))
             raw_pos = zoom.get("pos", 0)
