@@ -448,7 +448,11 @@ class ReolinkAPI:
         current = start
         forward_positive = ops[0] in ("Right", "Up")
 
-        for attempt in range(3):
+        # RLN36 Baichuan feedback arrives with significant delay and the camera
+        # coasts after Stop. Reversing to correct that delayed position causes
+        # visible left/right hunting. Start with one bounded movement per axis;
+        # retain the existing correction loop for directly connected cameras.
+        for attempt in range(1 if self.nvr_mode else 3):
             direction = self._axis_direction.get(axis)
             if direction is None:
                 progress = abs(current - start)
@@ -511,3 +515,10 @@ class ReolinkAPI:
                 "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d",
                 self.host, axis, op, speed, abs(remaining), abs(moved), abs(current - stopped_at),
             )
+        final = await self._axis_position(username, password, axis, channel)
+        raw_delta = final - start
+        logger.info(
+            "Camera %s: %s summary start=%d final=%d delta=%d requested=%.1f "
+            "direction=%s (NVR single-pass=%s)",
+            self.host, axis, start, final, raw_delta, distance, ops[0], self.nvr_mode,
+        )
