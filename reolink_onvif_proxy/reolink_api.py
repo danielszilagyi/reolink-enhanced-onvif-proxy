@@ -128,6 +128,8 @@ class ReolinkAPI:
             return PtzPosition(pan=pan, tilt=tilt)
         except Exception as e:
             logger.warning("Failed to get position for %s: %s", self.host, e)
+            if self.nvr_mode:
+                raise
             return PtzPosition()
 
     async def get_zoom_focus(self, username: str, password: str, channel: int = 0) -> ZoomFocus:
