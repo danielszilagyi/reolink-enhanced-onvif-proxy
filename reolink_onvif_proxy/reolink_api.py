@@ -397,6 +397,7 @@ class ReolinkAPI:
         tilt_units: float,
         move_speed: int = 15,
         channel: int = 0,
+        nvr_pulse_ms: int | None = None,
     ) -> bool:
         """Implement RelativeMove with ContinuousMove and position feedback.
 
@@ -437,14 +438,83 @@ class ReolinkAPI:
                             self.host, distance,
                         )
                         continue
-            await self._move_axis(
-                username, password, axis, ops, distance, tolerance, move_speed, channel
-            )
+            if nvr_pulse_ms is not None:
+                if not self.nvr_mode:
+                    raise ValueError("timed pulses require NVR mode")
+                await self._move_axis_timed(
+                    username, password, axis, ops[0], distance, move_speed,
+                    channel, nvr_pulse_ms,
+                )
+            else:
+                await self._move_axis(
+                    username, password, axis, ops, distance, tolerance, move_speed, channel
+                )
         return True
 
     async def _axis_position(self, username: str, password: str, axis: str, channel: int) -> int:
         pos = await self.get_position(username, password, channel)
         return pos.pan if axis == "pan" else pos.tilt
+
+    async def _move_axis_timed(
+        self,
+        username: str,
+        password: str,
+        axis: str,
+        op: str,
+        distance: float,
+        move_speed: int,
+        channel: int,
+        pulse_ms: int,
+    ) -> None:
+        """Experimental RLN36 open-loop pulse with post-stop measurement.
+
+        A single bounded pulse is intentionally used for each RelativeMove
+        axis. Baichuan is read only before the command and AFTER Stop, avoiding
+        command prolongation from slow HTTP/Baichuan polling. No reversing or
+        automatic repeated pulses: observe minimum travel before adding control.
+        """
+        start = await self._axis_position(username, password, axis, channel)
+        command_start = time.monotonic()
+        try:
+            if not await self.ptz_control(username, password, op, move_speed, channel):
+                raise RuntimeError(f"PTZ {op} rejected on channel {channel}")
+            acknowledged_at = time.monotonic()
+            try:
+                await asyncio.sleep(pulse_ms / 1000)
+            finally:
+                # Cancellation MUST still send Stop.
+                await asyncio.shield(
+                    self.ptz_control(username, password, "Stop", channel=channel)
+                )
+        except BaseException:
+            # If command transmission itself failed, a Stop is safe as well.
+            await asyncio.shield(
+                self.ptz_control(username, password, "Stop", channel=channel)
+            )
+            raise
+        stop_at = time.monotonic()
+
+        # Delayed Baichuan updates may report the pre-stop position. Require
+        # repeated stable observations over a bounded interval; this is only
+        # a measurement, never a reason to keep driving the motor.
+        readings = []
+        for _ in range(12):
+            await asyncio.sleep(0.15)
+            position = await self._axis_position(username, password, axis, channel)
+            readings.append(position)
+        final = readings[-1]
+        signed = final - start
+        expected_sign = 1 if op in ("Right", "Down") else -1
+        progress = signed * expected_sign
+        logger.info(
+            "Camera %s: timed NVR %s %s channel=%d speed=%d requested=%.1f "
+            "pulse_ms=%d start=%d samples=%s final=%d delta=%d progress=%d "
+            "send_ms=%.0f stop_and_pulse_ms=%.0f",
+            self.host, axis, op, channel, move_speed, distance,
+            pulse_ms, start, readings, final, signed, progress,
+            (acknowledged_at - command_start) * 1000,
+            (stop_at - acknowledged_at) * 1000,
+        )
 
     async def _move_axis(
         self,
