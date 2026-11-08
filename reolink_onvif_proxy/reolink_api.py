@@ -50,6 +50,8 @@ class ReolinkAPI:
         self._axis_direction: dict[str, int] = {}  # +1 if Right/Up increases position
         self._lead: dict[str, float] = {}  # axis -> overshoot past the stop point
         self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
+        self._nvr_rate: dict[str, float] = {}
+        self._nvr_coast: dict[str, float] = {}
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -415,7 +417,8 @@ class ReolinkAPI:
                 if not self._has_tilt:
                     raise RuntimeError("Tilt feedback unavailable")
                 ops = ("Up", "Down") if amount > 0 else ("Down", "Up")
-            await self._move_axis(
+            mover = self._move_axis_nvr if self.nvr_mode else self._move_axis
+            await mover(
                 username, password, axis, ops, distance, tolerance, move_speed, channel
             )
         return True
