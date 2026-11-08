@@ -23,13 +23,13 @@ async def start_proxy(config_path: str):
     apis: list[ReolinkAPI] = []
 
     for cam in config.cameras:
-        api = ReolinkAPI(cam.host, cam.port)
+        api = ReolinkAPI(cam.host, cam.port, nvr_mode=cam.channel is not None)
         apis.append(api)
 
         # Probe camera capabilities if credentials are available
         if cam.username and cam.password:
             try:
-                await api.probe_capabilities(cam.username, cam.password)
+                await api.probe_capabilities(cam.username, cam.password, channel=cam.channel or 0)
             except Exception as e:
                 logger.warning("Failed to probe capabilities for '%s': %s", cam.name, e)
 
