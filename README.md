@@ -109,6 +109,31 @@ The NVR's `Set3DPos` reports `rspCode: -4` despite capability
 advertisement and is disabled in NVR mode. Relative movement is bounded to
 short commands and sends `Stop` on errors or cancellation.
 
+A new **opt-in experimental timed pulse mode** is available for RLN36
+diagnostics. It sends one bounded pulse per requested axis, issues Stop,
+and **only then** samples Baichuan position twelve times (150 ms apart).
+This does not yet adapt pulse durations or guarantee click-to-center accuracy.
+It is intended to characterize the NVR's minimum movement and command delay.
+
+```yaml
+cameras:
+  - name: fatarolo
+    host: 192.168.20.220
+    channel: 8
+    listen_port: 8001
+    fov_pan_units: 390
+    fov_tilt_units: 260
+    move_speed: 3
+    nvr_move_mode: timed_pulse # opt in; default: feedback
+    nvr_pulse_ms: 120          # 50-500; start with 120
+```
+
+Look for `timed NVR pan` / `timed NVR tilt` logs: they include
+requested distance, actual delta, all post-stop readings, command ack time,
+and the elapsed pulse/Stop time. Start with an unobstructed travel range,
+minimum zoom and a single click. **Do not enable autotracking in this mode.**
+Switch back to `nvr_move_mode: feedback` to revert.
+
 The experimental adaptive pulse controller was reverted after unreliable physical
 movement on an RLN36. NVR relative movement currently uses a single bounded
 feedback pass without reverse correction. This is a temporary, imperfect
@@ -225,6 +250,8 @@ cameras:
     fov_pan_units: int    # Horizontal FOV in position units at full zoom-out (default: 170)
     fov_tilt_units: int   # Vertical FOV in position units at full zoom-out (default: 95)
     move_speed: int       # Movement speed for feedback moves, 1-64 (default: 15)
+    nvr_move_mode: string # feedback (default) or timed_pulse (NVR only)
+    nvr_pulse_ms: int     # Timed pulse length, 50-500 ms (default: 120)
 ```
 
 The `fov_pan_units` and `fov_tilt_units` values control how far the camera moves for click-to-move. Increase them if the camera doesn't move far enough, decrease if it overshoots. These values are automatically scaled by zoom level — when zoomed in, movements are proportionally smaller.
