@@ -427,6 +427,98 @@ class ReolinkAPI:
         pos = await self.get_position(username, password, channel)
         return pos.pan if axis == "pan" else pos.tilt
 
+    async def _move_axis_nvr(
+        self, username: str, password: str, axis: str,
+        ops: tuple[str, str], distance: float, tolerance: float,
+        move_speed: int, channel: int,
+    ) -> None:
+        """NVR-specific bounded single-pass movement with adaptive stopping."""
+        start = await self._axis_position(username, password, axis, channel)
+        op = ops[0]
+        speed = min(move_speed, 5 if distance < 100 else 10)
+        coast_estimate = self._nvr_coast.get(axis, 0.0)
+        rate_estimate = self._nvr_rate.get(axis)
+        # Until a real rate is measured, make only a short probing movement.
+        duration_limit = (
+            max(0.15, min(3.0, (distance - coast_estimate) / rate_estimate))
+            if rate_estimate and rate_estimate > 0 else 0.2
+        )
+        started = time.monotonic()
+        current = start
+        stop_position = start
+        reason = "duration-limit"
+        if not await self.ptz_control(username, password, op, speed, channel):
+            raise RuntimeError(f"NVR PTZ {op} rejected on channel {channel}")
+        try:
+            deadline = time.monotonic() + duration_limit
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    current = await asyncio.wait_for(
+                        self._axis_position(username, password, axis, channel),
+                        timeout=min(0.7, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    reason = "feedback-timeout"
+                    break
+                if abs(current - start) > 18000:
+                    reason = "position-discontinuity"
+                    break
+                if abs(current - start) + coast_estimate >= distance - tolerance:
+                    reason = "target-minus-coast"
+                    break
+            stop_position = current
+        finally:
+            stopped_at = time.monotonic()
+            stop_task = asyncio.create_task(
+                self.ptz_control(username, password, "Stop", channel=channel)
+            )
+            try:
+                stopped = await asyncio.shield(stop_task)
+            except asyncio.CancelledError:
+                # The stop request must finish even when a new click cancels us.
+                await stop_task
+                raise
+            if not stopped:
+                raise RuntimeError(f"NVR Stop rejected on channel {channel}")
+        elapsed = stopped_at - started
+
+        # The Baichuan feed can be stale for multiple successive samples.
+        final = stop_position
+        stable = 0
+        settle_deadline = time.monotonic() + 2.0
+        while time.monotonic() < settle_deadline:
+            await asyncio.sleep(0.12)
+            position = await self._axis_position(username, password, axis, channel)
+            stable = stable + 1 if position == final else 0
+            final = position
+            if stable >= 3:
+                break
+
+        delta = final - start
+        actual = abs(delta)
+        if actual > 18000:
+            raise RuntimeError(f"NVR {axis} position jumped from {start} to {final}")
+        coast = abs(final - stop_position)
+        if actual and elapsed > 0:
+            rate = actual / elapsed
+            old_rate = self._nvr_rate.get(axis)
+            self._nvr_rate[axis] = rate if old_rate is None else 0.6 * old_rate + 0.4 * rate
+            old_coast = self._nvr_coast.get(axis)
+            self._nvr_coast[axis] = coast if old_coast is None else 0.6 * old_coast + 0.4 * coast
+        logger.info(
+            "Camera %s: NVR %s %s start=%d stopped=%d final=%d "
+            "requested=%.1f actual=%d error=%.1f coast=%d elapsed=%.2fs "
+            "reason=%s learned_rate=%.1f learned_coast=%.1f",
+            self.host, axis, op, start, stop_position, final, distance,
+            actual, distance - actual, coast, elapsed, reason,
+            self._nvr_rate.get(axis, 0.0), self._nvr_coast.get(axis, 0.0),
+        )
+        if not actual:
+            raise RuntimeError(f"No NVR {axis} movement observed on channel {channel}")
+
     async def _move_axis(
         self,
         username: str,
