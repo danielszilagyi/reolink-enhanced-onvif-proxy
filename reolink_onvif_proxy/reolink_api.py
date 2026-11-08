@@ -79,34 +79,25 @@ class ReolinkAPI:
         """Probe camera to determine which PTZ features it supports."""
         api = await self._ensure_connected(username, password)
 
-        # Check Set3DPos support
-        self._supports_3d_pos = api.supported(channel, "ptz_3d_zoom")
-
-        # If reolink_aio doesn't know about ptz_3d_zoom yet, probe directly
-        if not self._supports_3d_pos:
-            try:
-                result = await api.send(
-                    [{"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}}],
-                    expected_response_type="json",
-                )
-                if result and result[0].get("code") == 0:
-                    self._supports_3d_pos = True
-            except Exception:
-                self._supports_3d_pos = False
-
-        # NVR HTTP responses may report only Ppos. Do not assume tilt
-        # feedback exists until it is observed.
         if self.nvr_mode:
-            result = await api.send(
-                [{"cmd": "GetPtzCurPos", "action": 0,
-                  "param": {"PtzCurPos": {"channel": channel}}}],
-                expected_response_type="json",
-            )
-            value = (result[0].get("value") or {}).get("PtzCurPos", {}) if result else {}
-            self._has_tilt = result[0].get("code") == 0 and "Tpos" in value if result else False
+            # The RLN36 rejects Set3DPos even if the capability is advertised.
+            self._supports_3d_pos = False
+            await api.baichuan._send_and_parse(433, channel)
+            values = api._ptz_position.get(channel, {})
+            self._has_tilt = 'Tpos' in values
+            logger.info('NVR channel %d Baichuan PTZ feedback: %s', channel, values)
         else:
+            self._supports_3d_pos = api.supported(channel, 'ptz_3d_zoom')
+            if not self._supports_3d_pos:
+                try:
+                    result = await api.send(
+                        [{'cmd': 'Get3DPos', 'action': 1, 'param': {'channel': channel}}],
+                        expected_response_type='json',
+                    )
+                    self._supports_3d_pos = bool(result and result[0].get('code') == 0)
+                except Exception:
+                    self._supports_3d_pos = False
             self._has_tilt = True
-
         logger.info(
             "Camera %s capabilities: Set3DPos=%s, has_tilt=%s",
             self.host, self._supports_3d_pos, self._has_tilt,
@@ -125,15 +116,11 @@ class ReolinkAPI:
         try:
             api = await self._ensure_connected(username, password)
             if self.nvr_mode:
-                result = await api.send(
-                    [{"cmd": "GetPtzCurPos", "action": 0,
-                      "param": {"PtzCurPos": {"channel": channel}}}],
-                    expected_response_type="json",
-                )
-                if not result or result[0].get("code") != 0:
-                    raise ValueError(f"GetPtzCurPos failed: {result}")
-                pos = result[0]["value"]["PtzCurPos"]
-                return PtzPosition(pan=pos.get("Ppos", 0), tilt=pos.get("Tpos", 0))
+                await api.baichuan._send_and_parse(433, channel)
+                pos = api._ptz_position.get(channel, {})
+                if 'Ppos' not in pos or (self._has_tilt and 'Tpos' not in pos):
+                    raise RuntimeError(f'Incomplete Baichuan position for channel {channel}: {pos}')
+                return PtzPosition(pan=pos['Ppos'], tilt=pos.get('Tpos', 0))
             # Refresh position data
             await api.get_states(cmd_list={"GetPtzCurPos": {channel: 1}})
             pan = api.ptz_pan_position(channel) or 0
