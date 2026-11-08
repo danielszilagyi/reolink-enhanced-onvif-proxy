@@ -232,7 +232,7 @@ class ReolinkAPI:
         """Send a 3D zoom command (Set3DPos)."""
         api = await self._ensure_connected(username, password)
         try:
-            await api.send_setting(
+            result = await api.send(
                 [
                     {
                         "cmd": "Set3DPos",
@@ -250,10 +250,16 @@ class ReolinkAPI:
                             }
                         },
                     }
-                ]
+                ],
+                expected_response_type="json",
             )
+            if not result or result[0].get("code") != 0:
+                self._supports_3d_pos = False
+                logger.error("Set3DPos rejected on channel %d: %s", channel, result)
+                return False
             return True
         except Exception as e:
+            self._supports_3d_pos = False
             logger.error("Set3DPos failed for %s: %s", self.host, e)
             return False
 
