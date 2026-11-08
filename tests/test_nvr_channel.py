@@ -97,3 +97,29 @@ def test_nvr_retains_normal_sized_relative_move():
     assert result is True
     assert api._move_axis.await_count == 1
     assert api._move_axis.await_args.args[2] == "pan"
+
+
+def test_nvr_skips_upward_tilt_at_mechanical_limit():
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    api._axis_position = AsyncMock(return_value=0)
+    api._move_axis = AsyncMock()
+
+    assert run(api.relative_move_feedback(
+        "admin", "password", pan=0.0, tilt=0.611,
+        pan_units=340, tilt_units=190, move_speed=15, channel=8,
+    ))
+    api._axis_position.assert_awaited_once()
+    api._move_axis.assert_not_awaited()
+
+
+def test_nvr_tilt_down_allowed_from_upper_limit():
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    api._axis_position = AsyncMock(return_value=0)
+    api._move_axis = AsyncMock()
+
+    assert run(api.relative_move_feedback(
+        "admin", "password", pan=0.0, tilt=-0.611,
+        pan_units=340, tilt_units=190, move_speed=15, channel=8,
+    ))
+    assert api._move_axis.await_count == 1
+    assert api._move_axis.await_args.args[3][0] == "Down"
