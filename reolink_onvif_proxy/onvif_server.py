@@ -432,6 +432,12 @@ class ONVIFServer:
         zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
         start_step = zf.zoom_pos
         mag = self._zoom_curve(zf).magnification(start_step) if zf.zoom_max > zf.zoom_min else 1.0
+        logger.info(
+            "Camera %s: RelativeMove feedback zoom_step=%d range=%d..%d "
+            "magnification=%.3f pan_units=%.1f tilt_units=%.1f",
+            self.config.name, start_step, zf.zoom_min, zf.zoom_max,
+            mag, self.config.fov_pan_units / mag, self.config.fov_tilt_units / mag,
+        )
         await self.api.relative_move_feedback(
             username=username, password=password,
             pan=pan, tilt=tilt,
