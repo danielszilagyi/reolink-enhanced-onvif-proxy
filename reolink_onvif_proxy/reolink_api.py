@@ -52,6 +52,7 @@ class ReolinkAPI:
         self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
         self._nvr_rate: dict[str, float] = {}
         self._nvr_coast: dict[str, float] = {}
+        self._nvr_move_lock = asyncio.Lock()
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -428,6 +429,18 @@ class ReolinkAPI:
         return pos.pan if axis == "pan" else pos.tilt
 
     async def _move_axis_nvr(
+        self, username: str, password: str, axis: str,
+        ops: tuple[str, str], distance: float, tolerance: float,
+        move_speed: int, channel: int,
+    ) -> None:
+        # Serialize successive clicks so an earlier command's Stop cannot
+        # interrupt a newer command's movement.
+        async with self._nvr_move_lock:
+            await self._move_axis_nvr_locked(
+                username, password, axis, ops, distance, tolerance, move_speed, channel
+            )
+
+    async def _move_axis_nvr_locked(
         self, username: str, password: str, axis: str,
         ops: tuple[str, str], distance: float, tolerance: float,
         move_speed: int, channel: int,
