@@ -486,8 +486,18 @@ class ReolinkAPI:
 
             op = ops[0] if remaining > 0 else ops[1]
             speed = move_speed if attempt == 0 else max(1, move_speed // 3)
-            lead = self._lead.get(axis, 0.0)
+            raw_lead = self._lead.get(axis, 0.0)
+            # RLN36 feedback can arrive after Stop. A previously learned
+            # overshoot must not reduce a large requested move to a tiny pulse:
+            # cap the stop allowance to 25% of THIS move's distance.
+            lead = min(raw_lead, abs(remaining) * 0.25) if self.nvr_mode else raw_lead
             target = max(abs(remaining) - lead, 1.0)
+            if self.nvr_mode:
+                logger.info(
+                    "Camera %s: NVR %s %s requested=%.1f lead_raw=%.1f "
+                    "lead_used=%.1f stop_target=%.1f",
+                    self.host, axis, op, abs(remaining), raw_lead, lead, target,
+                )
             if attempt > 0 and self._min_pulse.get(axis, 0.0) >= 2 * abs(remaining):
                 break  # smallest possible nudge would land further off
             segment_start = current
@@ -534,8 +544,10 @@ class ReolinkAPI:
                 prev = self._lead.get(axis)
                 self._lead[axis] = overshoot if prev is None else 0.5 * prev + 0.5 * overshoot
             logger.info(
-                "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d",
-                self.host, axis, op, speed, abs(remaining), abs(moved), abs(current - stopped_at),
+                "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d "
+                "lead_used=%.1f stop_target=%.1f",
+                self.host, axis, op, speed, abs(remaining), abs(moved),
+                abs(current - stopped_at), lead, target,
             )
         final = await self._axis_position(username, password, axis, channel)
         raw_delta = final - start
