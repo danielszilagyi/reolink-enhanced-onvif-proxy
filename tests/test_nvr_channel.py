@@ -16,25 +16,32 @@ def test_camera_config_channel_default_is_direct_camera():
     assert camera.channel is None
 
 
-def test_nvr_get_position_uses_nested_channel():
+def test_nvr_get_position_uses_baichuan_pan_and_tilt():
     api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
     host = AsyncMock()
-    host.send.return_value = [
-        {"cmd": "GetPtzCurPos", "code": 0,
-         "value": {"PtzCurPos": {"Ppos": 3607, "channel": 8}}}
-    ]
+    host._ptz_position = {8: {"Ppos": 3607, "Tpos": 945}}
     api._api = host
     api._logged_in = True
+    api._has_tilt = True
 
     pos = run(api.get_position("admin", "password", channel=8))
 
     assert pos.pan == 3607
-    assert pos.tilt == 0
-    host.send.assert_awaited_once_with(
-        [{"cmd": "GetPtzCurPos", "action": 0,
-          "param": {"PtzCurPos": {"channel": 8}}}],
-        expected_response_type="json",
-    )
+    assert pos.tilt == 945
+    host.baichuan._send_and_parse.assert_awaited_once_with(433, 8)
+    host.send.assert_not_awaited()
+
+
+def test_nvr_does_not_advertise_rejected_set3dpos():
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    host = AsyncMock()
+    host._ptz_position = {8: {"Ppos": 3607, "Tpos": 89}}
+    api._api = host
+    api._logged_in = True
+    run(api.probe_capabilities("admin", "password", channel=8))
+    assert not api.supports_3d_pos
+    assert api.has_tilt
+    host.baichuan._send_and_parse.assert_awaited_once_with(433, 8)
 
 
 def test_nvr_ptz_control_uses_selected_channel():
