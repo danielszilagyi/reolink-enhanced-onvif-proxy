@@ -407,6 +407,17 @@ class ReolinkAPI:
         for axis, amount, units in (("pan", pan, pan_units), ("tilt", tilt, tilt_units)):
             distance = abs(amount) * units / 2
             tolerance = max(2.0, units * 0.015)
+            # The RLN36 has a nontrivial minimum movement and delayed feedback.
+            # A ~3.5-unit tilt request previously generated a full motor pulse,
+            # then failed when Baichuan reported no change. Ignore sub-resolution
+            # requests instead of disrupting the rest of the RelativeMove.
+            if self.nvr_mode and distance < 10.0:
+                logger.info(
+                    "Camera %s: skipping sub-resolution NVR %s movement "
+                    "(requested=%.1f units, threshold=10.0)",
+                    self.host, axis, distance,
+                )
+                continue
             if distance < tolerance:
                 continue
             if axis == "pan":
