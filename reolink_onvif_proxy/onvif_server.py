@@ -125,6 +125,7 @@ class ONVIFServer:
         self.state = CameraState()
         self._app: web.Application | None = None
         self._action_task: asyncio.Task | None = None
+        self._action_tasks: set[asyncio.Task] = set()
 
     def create_app(self) -> web.Application:
         """Create the aiohttp web application."""
@@ -415,7 +416,14 @@ class ONVIFServer:
             self._start_action(self._relative_move_3d(pan, tilt, zoom, speed, username, password))
             return
 
-        self._start_action(self._relative_move_feedback(pan, tilt, zoom, username, password))
+        if self.api.nvr_mode:
+            # A second click/drag may arrive while the first is still moving.
+            # Do not cancel the earlier movement (including its zoom settling).
+            self._queue_action(
+                lambda: self._relative_move_feedback(pan, tilt, zoom, username, password)
+            )
+        else:
+            self._start_action(self._relative_move_feedback(pan, tilt, zoom, username, password))
 
     async def _relative_move_feedback(
         self, pan: float, tilt: float, zoom: float, username: str, password: str
@@ -523,19 +531,51 @@ class ONVIFServer:
         self.state.begin_action()
         task = asyncio.create_task(coro)
         self._action_task = task
+        self._action_tasks.add(task)
+        task.add_done_callback(self._action_done)
+
+    def _queue_action(self, coro_factory):
+        """Serialize NVR RelativeMove requests; don't lose rapid drag-to-zoom."""
+        previous = self._action_task
+        if previous is None or previous.done():
+            self._start_action(coro_factory())
+            return
+
+        async def run_after_previous():
+            try:
+                await previous
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The previous move is already logged by its done callback;
+                # still execute the user's next move.
+                pass
+            await coro_factory()
+
+        logger.info("Camera %s: queueing RelativeMove until current move finishes",
+                    self.config.name)
+        self.state.begin_action()
+        task = asyncio.create_task(run_after_previous())
+        self._action_task = task
+        self._action_tasks.add(task)
         task.add_done_callback(self._action_done)
 
     def _action_done(self, task: asyncio.Task):
+        self._action_tasks.discard(task)
         if self._action_task is task:
             self._action_task = None
-            self.state.end_action()
+            if not self._action_tasks:
+                self.state.end_action()
         if not task.cancelled() and task.exception() is not None:
             logger.error("Camera %s: move failed: %s", self.config.name, task.exception())
 
     def _cancel_action(self):
-        task, self._action_task = self._action_task, None
-        if task is not None and not task.done():
-            task.cancel()
+        # Cancel queued moves as well as the currently executing command.
+        for task in tuple(self._action_tasks):
+            if not task.done():
+                task.cancel()
+        self._action_tasks.clear()
+        self._action_task = None
         self.state.busy = False
 
     async def _handle_absolute_move(self, body: etree._Element, username: str, password: str):
