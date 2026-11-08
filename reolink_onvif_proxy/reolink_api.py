@@ -410,6 +410,8 @@ class ReolinkAPI:
             if axis == "pan":
                 ops = ("Right", "Left") if amount > 0 else ("Left", "Right")
             else:
+                if not self._has_tilt:
+                    raise RuntimeError("Tilt feedback unavailable")
                 ops = ("Up", "Down") if amount > 0 else ("Down", "Up")
             await self._move_axis(
                 username, password, axis, ops, distance, tolerance, move_speed, channel
@@ -462,14 +464,21 @@ class ReolinkAPI:
                 break  # smallest possible nudge would land further off
             segment_start = current
 
-            await self.ptz_control(username, password, op, speed, channel)
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-                current = await self._axis_position(username, password, axis, channel)
-                if abs(current - segment_start) >= target:
-                    break
-            await self.ptz_control(username, password, "Stop", channel=channel)
+            if not await self.ptz_control(username, password, op, speed, channel):
+                raise RuntimeError(f"PTZ {op} rejected on channel {channel}")
+            try:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                    current = await self._axis_position(username, password, axis, channel)
+                    if abs(current - segment_start) >= target:
+                        break
+            finally:
+                await asyncio.shield(self.ptz_control(
+                    username, password, "Stop", channel=channel
+                ))
+            if current == segment_start:
+                raise RuntimeError(f"No {axis} movement feedback on channel {channel}")
             stopped_at = current
 
             # Let it coast to rest
