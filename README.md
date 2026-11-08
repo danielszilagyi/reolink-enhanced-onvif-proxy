@@ -109,11 +109,10 @@ The NVR's `Set3DPos` reports `rspCode: -4` despite capability
 advertisement and is disabled in NVR mode. Relative movement is bounded to
 short commands and sends `Stop` on errors or cancellation.
 
-The NVR PTZ path uses conservative, serialized single-pass movements and
-records final pan/tilt errors. It starts with a short probing pulse, estimates
-travel rate and delayed movement after Stop independently for pan and tilt, and
-adjusts later pulse durations. It does not issue reverse correction commands.
-This adaptive controller is experimental and needs live calibration on each NVR.
+The experimental adaptive pulse controller was reverted after unreliable physical
+movement on an RLN36. NVR relative movement currently uses a single bounded
+feedback pass without reverse correction. This is a temporary, imperfect
+implementation: do not enable autotracking until positioning is reliable.
 
 **Test with a clear camera path and autotracking disabled first.**
 The movement calibration (`fov_pan_units` and `fov_tilt_units`) is
