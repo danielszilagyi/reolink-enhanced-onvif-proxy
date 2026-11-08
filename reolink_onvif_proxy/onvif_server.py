@@ -462,7 +462,7 @@ class ONVIFServer:
                 self.config.name, box.pos_x, box.pos_y,
                 box.pos_width, box.pos_height, box.width, box.height,
             )
-            await self.api.set_3d_pos(
+            success = await self.api.set_3d_pos(
                 username=username, password=password,
                 pos_x=box.pos_x, pos_y=box.pos_y,
                 pos_width=box.pos_width, pos_height=box.pos_height,
@@ -470,6 +470,8 @@ class ONVIFServer:
                 speed=box.speed,
                 channel=self.config.channel or 0,
             )
+            if not success:
+                raise RuntimeError("Set3DPos rejected by NVR; cannot calibrate FOV-relative movement")
             zf = await self._wait_until_settled(username, password)
 
         target_step = self._zoom_target(zf, start_step, zoom)
