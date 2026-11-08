@@ -439,6 +439,9 @@ class ONVIFServer:
             tilt_units=self.config.fov_tilt_units / mag,
             move_speed=self.config.move_speed,
             channel=self.config.channel or 0,
+            nvr_pulse_ms=(self.config.nvr_pulse_ms
+                          if self.config.nvr_move_mode == "timed_pulse" and self.api.nvr_mode
+                          else None),
         )
         target_step = self._zoom_target(zf, start_step, zoom)
         if target_step != start_step:
