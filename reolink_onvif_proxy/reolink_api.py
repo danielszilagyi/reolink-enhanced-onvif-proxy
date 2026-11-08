@@ -50,6 +50,7 @@ class ReolinkAPI:
         self._axis_direction: dict[str, int] = {}  # +1 if Right/Up increases position
         self._lead: dict[str, float] = {}  # axis -> overshoot past the stop point
         self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
+        self._last_valid_zoom: dict[int, int] = {}  # ignore transient invalid NVR readings
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -139,7 +140,7 @@ class ReolinkAPI:
             zf = api.zoom_range(channel)
             zoom = dict(zf.get("zoom", {}))
             focus = dict(zf.get("focus", {}))
-            if api.supported(channel, "zoom"):
+            if not self.nvr_mode and api.supported(channel, "zoom"):
                 await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
                 zf = api.zoom_range(channel)
                 zoom = zf.get("zoom", {})
@@ -155,8 +156,22 @@ class ReolinkAPI:
                     value = result[0]["value"]["ZoomFocus"]
                     zoom["pos"] = value.get("zoom", {}).get("pos", zoom.get("pos", 0))
                     focus["pos"] = value.get("focus", {}).get("pos", focus.get("pos", 0))
+            raw_pos = zoom.get("pos", 0)
+            z_min = int(zoom.get("min", 0))
+            z_max = int(zoom.get("max", 33))
+            if self.nvr_mode:
+                if not isinstance(raw_pos, (int, float)) or not z_min <= raw_pos <= z_max:
+                    replacement = self._last_valid_zoom.get(channel, z_min)
+                    logger.warning(
+                        "Camera %s NVR channel %d: invalid zoom position %r "
+                        "(range %d..%d); using last valid %d",
+                        self.host, channel, raw_pos, z_min, z_max, replacement,
+                    )
+                    raw_pos = replacement
+                else:
+                    self._last_valid_zoom[channel] = int(raw_pos)
             return ZoomFocus(
-                zoom_pos=zoom.get("pos", 0),
+                zoom_pos=int(raw_pos),
                 zoom_min=zoom.get("min", 0),
                 zoom_max=zoom.get("max", 33),
                 focus_pos=focus.get("pos", 0),
