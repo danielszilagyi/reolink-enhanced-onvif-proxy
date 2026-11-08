@@ -123,3 +123,27 @@ def test_nvr_tilt_down_allowed_from_upper_limit():
     ))
     assert api._move_axis.await_count == 1
     assert api._move_axis.await_args.args[3][0] == "Down"
+
+def test_nvr_lead_is_capped_to_prevent_premature_stop():
+    from unittest.mock import patch
+
+    api = ReolinkAPI("192.0.2.20", 80, nvr_mode=True)
+    api._lead["pan"] = 95.0
+    # 100 -> 110 -> 180: a 100-unit request must not stop at 110 merely
+    # because an earlier movement had an unusually large learned lead.
+    positions = iter([100, 110, 180, 180, 180, 180, 180])
+    api._axis_position = AsyncMock(side_effect=lambda *args: next(positions, 180))
+    api.ptz_control = AsyncMock(return_value=True)
+
+    async def instant_sleep(_seconds):
+        return None
+
+    with patch("reolink_onvif_proxy.reolink_api.asyncio.sleep", new=instant_sleep):
+        run(api._move_axis(
+            "admin", "password", "pan", ("Right", "Left"),
+            distance=100.0, tolerance=2.0, move_speed=15, channel=8,
+        ))
+
+    assert api._axis_position.await_count >= 4
+    commands = [call.args[2] for call in api.ptz_control.await_args_list]
+    assert commands == ["Right", "Stop"]
