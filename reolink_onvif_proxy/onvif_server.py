@@ -430,7 +430,8 @@ class ONVIFServer:
             pan_units=self.config.fov_pan_units / mag,
             tilt_units=self.config.fov_tilt_units / mag,
             move_speed=self.config.move_speed,
-         channel=self.config.channel or 0)
+            channel=self.config.channel or 0,
+        )
         target_step = self._zoom_target(zf, start_step, zoom)
         if target_step != start_step:
             logger.info(
@@ -467,6 +468,7 @@ class ONVIFServer:
                 pos_width=box.pos_width, pos_height=box.pos_height,
                 stream_width=box.width, stream_height=box.height,
                 speed=box.speed,
+                channel=self.config.channel or 0,
             )
             zf = await self._wait_until_settled(username, password)
 
