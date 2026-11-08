@@ -36,9 +36,10 @@ class StreamResolution:
 class ReolinkAPI:
     """Client for Reolink camera using reolink_aio (Baichuan protocol)."""
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, nvr_mode: bool = False):
         self.host = host
         self.port = port
+        self.nvr_mode = nvr_mode
         self._api: Host | None = None
         self._logged_in = False
         self._stream_resolution: StreamResolution | None = None
@@ -49,6 +50,8 @@ class ReolinkAPI:
         self._axis_direction: dict[str, int] = {}  # +1 if Right/Up increases position
         self._lead: dict[str, float] = {}  # axis -> overshoot past the stop point
         self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
+        self._last_valid_zoom: dict[int, int] = {}  # ignore transient invalid NVR readings
+        self._last_invalid_zoom_response: dict[int, str] = {}
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -78,24 +81,25 @@ class ReolinkAPI:
         """Probe camera to determine which PTZ features it supports."""
         api = await self._ensure_connected(username, password)
 
-        # Check Set3DPos support
-        self._supports_3d_pos = api.supported(channel, "ptz_3d_zoom")
-
-        # If reolink_aio doesn't know about ptz_3d_zoom yet, probe directly
-        if not self._supports_3d_pos:
-            try:
-                result = await api.send(
-                    [{"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}}],
-                    expected_response_type="json",
-                )
-                if result and result[0].get("code") == 0:
-                    self._supports_3d_pos = True
-            except Exception:
-                self._supports_3d_pos = False
-
-        # Baichuan always reports both Ppos and Tpos
-        self._has_tilt = True
-
+        if self.nvr_mode:
+            # The RLN36 rejects Set3DPos even if the capability is advertised.
+            self._supports_3d_pos = False
+            await api.baichuan._send_and_parse(433, channel)
+            values = api._ptz_position.get(channel, {})
+            self._has_tilt = 'Tpos' in values
+            logger.info('NVR channel %d Baichuan PTZ feedback: %s', channel, values)
+        else:
+            self._supports_3d_pos = api.supported(channel, 'ptz_3d_zoom')
+            if not self._supports_3d_pos:
+                try:
+                    result = await api.send(
+                        [{'cmd': 'Get3DPos', 'action': 1, 'param': {'channel': channel}}],
+                        expected_response_type='json',
+                    )
+                    self._supports_3d_pos = bool(result and result[0].get('code') == 0)
+                except Exception:
+                    self._supports_3d_pos = False
+            self._has_tilt = True
         logger.info(
             "Camera %s capabilities: Set3DPos=%s, has_tilt=%s",
             self.host, self._supports_3d_pos, self._has_tilt,
@@ -113,8 +117,12 @@ class ReolinkAPI:
         """Get current PTZ pan/tilt position via Baichuan."""
         try:
             api = await self._ensure_connected(username, password)
-            pan = api.ptz_pan_position(channel)
-            tilt = api.ptz_tilt_position(channel)
+            if self.nvr_mode:
+                await api.baichuan._send_and_parse(433, channel)
+                pos = api._ptz_position.get(channel, {})
+                if 'Ppos' not in pos or (self._has_tilt and 'Tpos' not in pos):
+                    raise RuntimeError(f'Incomplete Baichuan position for channel {channel}: {pos}')
+                return PtzPosition(pan=pos['Ppos'], tilt=pos.get('Tpos', 0))
             # Refresh position data
             await api.get_states(cmd_list={"GetPtzCurPos": {channel: 1}})
             pan = api.ptz_pan_position(channel) or 0
@@ -122,6 +130,8 @@ class ReolinkAPI:
             return PtzPosition(pan=pan, tilt=tilt)
         except Exception as e:
             logger.warning("Failed to get position for %s: %s", self.host, e)
+            if self.nvr_mode:
+                raise
             return PtzPosition()
 
     async def get_zoom_focus(self, username: str, password: str, channel: int = 0) -> ZoomFocus:
@@ -131,7 +141,7 @@ class ReolinkAPI:
             zf = api.zoom_range(channel)
             zoom = dict(zf.get("zoom", {}))
             focus = dict(zf.get("focus", {}))
-            if api.supported(channel, "zoom"):
+            if not self.nvr_mode and api.supported(channel, "zoom"):
                 await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
                 zf = api.zoom_range(channel)
                 zoom = zf.get("zoom", {})
@@ -145,10 +155,33 @@ class ReolinkAPI:
                 )
                 if result and result[0].get("code") == 0:
                     value = result[0]["value"]["ZoomFocus"]
+                    if self.nvr_mode:
+                        response_zoom = value.get("zoom", {}).get("pos")
+                        if not isinstance(response_zoom, (int, float)) or response_zoom < 0:
+                            signature = repr(result[0])
+                            if self._last_invalid_zoom_response.get(channel) != signature:
+                                logger.warning("Camera %s NVR channel %d: raw invalid GetZoomFocus response: %s", self.host, channel, signature)
+                                self._last_invalid_zoom_response[channel] = signature
+                        else:
+                            self._last_invalid_zoom_response.pop(channel, None)
                     zoom["pos"] = value.get("zoom", {}).get("pos", zoom.get("pos", 0))
                     focus["pos"] = value.get("focus", {}).get("pos", focus.get("pos", 0))
+            raw_pos = zoom.get("pos", 0)
+            z_min = int(zoom.get("min", 0))
+            z_max = int(zoom.get("max", 33))
+            if self.nvr_mode:
+                if not isinstance(raw_pos, (int, float)) or not z_min <= raw_pos <= z_max:
+                    replacement = self._last_valid_zoom.get(channel, z_min)
+                    logger.warning(
+                        "Camera %s NVR channel %d: invalid zoom position %r "
+                        "(range %d..%d); using last valid %d",
+                        self.host, channel, raw_pos, z_min, z_max, replacement,
+                    )
+                    raw_pos = replacement
+                else:
+                    self._last_valid_zoom[channel] = int(raw_pos)
             return ZoomFocus(
-                zoom_pos=zoom.get("pos", 0),
+                zoom_pos=int(raw_pos),
                 zoom_min=zoom.get("min", 0),
                 zoom_max=zoom.get("max", 33),
                 focus_pos=focus.get("pos", 0),
@@ -213,7 +246,7 @@ class ReolinkAPI:
         """Send a 3D zoom command (Set3DPos)."""
         api = await self._ensure_connected(username, password)
         try:
-            await api.send_setting(
+            result = await api.send(
                 [
                     {
                         "cmd": "Set3DPos",
@@ -231,10 +264,16 @@ class ReolinkAPI:
                             }
                         },
                     }
-                ]
+                ],
+                expected_response_type="json",
             )
+            if not result or result[0].get("code") != 0:
+                self._supports_3d_pos = False
+                logger.error("Set3DPos rejected on channel %d: %s", channel, result)
+                return False
             return True
         except Exception as e:
+            self._supports_3d_pos = False
             logger.error("Set3DPos failed for %s: %s", self.host, e)
             return False
 
@@ -244,6 +283,13 @@ class ReolinkAPI:
         """Send a PTZ control command."""
         api = await self._ensure_connected(username, password)
         try:
+            if self.nvr_mode:
+                result = await api.send(
+                    [{"cmd": "PtzCtrl", "action": 0,
+                      "param": {"channel": channel, "op": op, "speed": speed}}],
+                    expected_response_type="json",
+                )
+                return bool(result and result[0].get("code") == 0)
             if self._supports_ptz_speed:
                 await api.set_ptz_command(channel, command=op, speed=speed)
             else:
@@ -376,6 +422,7 @@ class ReolinkAPI:
         tilt_units: float,
         move_speed: int = 15,
         channel: int = 0,
+        nvr_pulse_ms: int | None = None,
     ) -> bool:
         """Implement RelativeMove with ContinuousMove and position feedback.
 
@@ -386,20 +433,113 @@ class ReolinkAPI:
         for axis, amount, units in (("pan", pan, pan_units), ("tilt", tilt, tilt_units)):
             distance = abs(amount) * units / 2
             tolerance = max(2.0, units * 0.015)
+            # The RLN36 has a nontrivial minimum movement and delayed feedback.
+            # A ~3.5-unit tilt request previously generated a full motor pulse,
+            # then failed when Baichuan reported no change. Ignore sub-resolution
+            # requests instead of disrupting the rest of the RelativeMove.
+            if self.nvr_mode and distance < 10.0:
+                logger.info(
+                    "Camera %s: skipping sub-resolution NVR %s movement "
+                    "(requested=%.1f units, threshold=10.0)",
+                    self.host, axis, distance,
+                )
+                continue
             if distance < tolerance:
                 continue
             if axis == "pan":
                 ops = ("Right", "Left") if amount > 0 else ("Left", "Right")
             else:
+                if not self._has_tilt:
+                    raise RuntimeError("Tilt feedback unavailable")
                 ops = ("Up", "Down") if amount > 0 else ("Down", "Up")
-            await self._move_axis(
-                username, password, axis, ops, distance, tolerance, move_speed, channel
-            )
+                if self.nvr_mode and ops[0] == "Up":
+                    current_tilt = await self._axis_position(
+                        username, password, "tilt", channel
+                    )
+                    if current_tilt == 0:
+                        logger.info(
+                            "Camera %s: skipping NVR tilt Up: already at upper limit "
+                            "(Tpos=0, requested=%.1f units)",
+                            self.host, distance,
+                        )
+                        continue
+            if nvr_pulse_ms is not None:
+                if not self.nvr_mode:
+                    raise ValueError("timed pulses require NVR mode")
+                await self._move_axis_timed(
+                    username, password, axis, ops[0], distance, move_speed,
+                    channel, nvr_pulse_ms,
+                )
+            else:
+                await self._move_axis(
+                    username, password, axis, ops, distance, tolerance, move_speed, channel
+                )
         return True
 
     async def _axis_position(self, username: str, password: str, axis: str, channel: int) -> int:
         pos = await self.get_position(username, password, channel)
         return pos.pan if axis == "pan" else pos.tilt
+
+    async def _move_axis_timed(
+        self,
+        username: str,
+        password: str,
+        axis: str,
+        op: str,
+        distance: float,
+        move_speed: int,
+        channel: int,
+        pulse_ms: int,
+    ) -> None:
+        """Experimental RLN36 open-loop pulse with post-stop measurement.
+
+        A single bounded pulse is intentionally used for each RelativeMove
+        axis. Baichuan is read only before the command and AFTER Stop, avoiding
+        command prolongation from slow HTTP/Baichuan polling. No reversing or
+        automatic repeated pulses: observe minimum travel before adding control.
+        """
+        start = await self._axis_position(username, password, axis, channel)
+        command_start = time.monotonic()
+        try:
+            if not await self.ptz_control(username, password, op, move_speed, channel):
+                raise RuntimeError(f"PTZ {op} rejected on channel {channel}")
+            acknowledged_at = time.monotonic()
+            try:
+                await asyncio.sleep(pulse_ms / 1000)
+            finally:
+                # Cancellation MUST still send Stop.
+                await asyncio.shield(
+                    self.ptz_control(username, password, "Stop", channel=channel)
+                )
+        except BaseException:
+            # If command transmission itself failed, a Stop is safe as well.
+            await asyncio.shield(
+                self.ptz_control(username, password, "Stop", channel=channel)
+            )
+            raise
+        stop_at = time.monotonic()
+
+        # Delayed Baichuan updates may report the pre-stop position. Require
+        # repeated stable observations over a bounded interval; this is only
+        # a measurement, never a reason to keep driving the motor.
+        readings = []
+        for _ in range(12):
+            await asyncio.sleep(0.15)
+            position = await self._axis_position(username, password, axis, channel)
+            readings.append(position)
+        final = readings[-1]
+        signed = final - start
+        expected_sign = 1 if op in ("Right", "Down") else -1
+        progress = signed * expected_sign
+        logger.info(
+            "Camera %s: timed NVR %s %s channel=%d speed=%d requested=%.1f "
+            "pulse_ms=%d start=%d samples=%s final=%d delta=%d progress=%d "
+            "send_ms=%.0f stop_and_pulse_ms=%.0f",
+            self.host, axis, op, channel, move_speed, distance,
+            pulse_ms, start, readings, final, signed, progress,
+            (acknowledged_at - command_start) * 1000,
+            (stop_at - acknowledged_at) * 1000,
+        )
 
     async def _move_axis(
         self,
@@ -425,7 +565,11 @@ class ReolinkAPI:
         current = start
         forward_positive = ops[0] in ("Right", "Up")
 
-        for attempt in range(3):
+        # RLN36 Baichuan feedback arrives with significant delay and the camera
+        # coasts after Stop. Reversing to correct that delayed position causes
+        # visible left/right hunting. Start with one bounded movement per axis;
+        # retain the existing correction loop for directly connected cameras.
+        for attempt in range(1 if self.nvr_mode else 3):
             direction = self._axis_direction.get(axis)
             if direction is None:
                 progress = abs(current - start)
@@ -437,20 +581,62 @@ class ReolinkAPI:
 
             op = ops[0] if remaining > 0 else ops[1]
             speed = move_speed if attempt == 0 else max(1, move_speed // 3)
-            lead = self._lead.get(axis, 0.0)
+            raw_lead = self._lead.get(axis, 0.0)
+            # RLN36 feedback can arrive after Stop. A previously learned
+            # overshoot must not reduce a large requested move to a tiny pulse:
+            # cap the stop allowance to 25% of THIS move's distance.
+            lead = min(raw_lead, abs(remaining) * 0.25) if self.nvr_mode else raw_lead
             target = max(abs(remaining) - lead, 1.0)
+            if self.nvr_mode:
+                logger.info(
+                    "Camera %s: NVR %s %s requested=%.1f lead_raw=%.1f "
+                    "lead_used=%.1f stop_target=%.1f",
+                    self.host, axis, op, abs(remaining), raw_lead, lead, target,
+                )
             if attempt > 0 and self._min_pulse.get(axis, 0.0) >= 2 * abs(remaining):
                 break  # smallest possible nudge would land further off
             segment_start = current
 
-            await self.ptz_control(username, password, op, speed, channel)
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-                current = await self._axis_position(username, password, axis, channel)
-                if abs(current - segment_start) >= target:
-                    break
-            await self.ptz_control(username, password, "Stop", channel=channel)
+            command_start = time.monotonic()
+            if not await self.ptz_control(username, password, op, speed, channel):
+                raise RuntimeError(f"PTZ {op} rejected on channel {channel}")
+            started_at = time.monotonic()
+            reason = "timeout"
+            polls = 0
+            stop_ok = False
+            stop_ms = 0.0
+            try:
+                deadline = started_at + 2.0
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                    current = await self._axis_position(username, password, axis, channel)
+                    polls += 1
+                    if abs(current - segment_start) >= target:
+                        reason = "target"
+                        break
+            finally:
+                stop_started = time.monotonic()
+                # Explicitly verify the response: a failed Stop must not be
+                # reported as a successful RelativeMove.
+                stop_ok = await asyncio.shield(self.ptz_control(
+                    username, password, "Stop", channel=channel
+                ))
+                stop_ms = (time.monotonic() - stop_started) * 1000
+                logger.info(
+                    "Camera %s: NVR %s %s stop_ack=%s reason=%s "
+                    "start_ack_ms=%.0f motor_ms=%.0f stop_ms=%.0f polls=%d "
+                    "position_at_stop=%d target=%.1f",
+                    self.host, axis, op, stop_ok, reason,
+                    (started_at - command_start) * 1000,
+                    (stop_started - started_at) * 1000,
+                    stop_ms, polls, current, target,
+                )
+            if not stop_ok:
+                raise RuntimeError(
+                    f"PTZ Stop rejected for {axis} {op} on channel {channel}"
+                )
+            if current == segment_start:
+                raise RuntimeError(f"No {axis} movement feedback on channel {channel}")
             stopped_at = current
 
             # Let it coast to rest
@@ -478,6 +664,15 @@ class ReolinkAPI:
                 prev = self._lead.get(axis)
                 self._lead[axis] = overshoot if prev is None else 0.5 * prev + 0.5 * overshoot
             logger.info(
-                "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d",
-                self.host, axis, op, speed, abs(remaining), abs(moved), abs(current - stopped_at),
+                "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d "
+                "lead_used=%.1f stop_target=%.1f",
+                self.host, axis, op, speed, abs(remaining), abs(moved),
+                abs(current - stopped_at), lead, target,
             )
+        final = await self._axis_position(username, password, axis, channel)
+        raw_delta = final - start
+        logger.info(
+            "Camera %s: %s summary start=%d final=%d delta=%d requested=%.1f "
+            "direction=%s (NVR single-pass=%s)",
+            self.host, axis, start, final, raw_delta, distance, ops[0], self.nvr_mode,
+        )

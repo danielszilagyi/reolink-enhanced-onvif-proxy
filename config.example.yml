@@ -2,6 +2,9 @@ cameras:
   - name: front_yard
     host: 192.168.1.10
     port: 80
+    # For an NVR, specify its zero-based channel index (e.g. 8 for Preview_09_main).
+    # Omit channel when connecting directly to a camera.
+    # channel: 8
     username: admin
     password: your_password
     listen_port: 8001

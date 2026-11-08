@@ -125,6 +125,7 @@ class ONVIFServer:
         self.state = CameraState()
         self._app: web.Application | None = None
         self._action_task: asyncio.Task | None = None
+        self._action_tasks: set[asyncio.Task] = set()
 
     def create_app(self) -> web.Application:
         """Create the aiohttp web application."""
@@ -282,12 +283,12 @@ class ONVIFServer:
             return responses.get_nodes()
 
         elif action == "GetPresets":
-            presets = await self.api.get_presets(username, password)
+            presets = await self.api.get_presets(username, password, channel=self.config.channel or 0)
             return responses.get_presets(presets)
 
         elif action == "GetStatus":
-            pos = await self.api.get_position(username, password)
-            zf = await self.api.get_zoom_focus(username, password)
+            pos = await self.api.get_position(username, password, channel=self.config.channel or 0)
+            zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
             self.state.update_position(pos, zf)
             logger.info(
                 "Camera %s: GetStatus pan=%d tilt=%d zoom=%d/%d status=%s",
@@ -303,7 +304,7 @@ class ONVIFServer:
             )
 
         elif action == "ContinuousMove":
-            self._cancel_action()
+            self._cancel_action(reason="ContinuousMove")
             await self._handle_continuous_move(body, username, password)
             return responses.simple_response("tptz", "ContinuousMove")
 
@@ -312,18 +313,18 @@ class ONVIFServer:
             return responses.simple_response("tptz", "RelativeMove")
 
         elif action == "AbsoluteMove":
-            self._cancel_action()
+            self._cancel_action(reason="AbsoluteMove")
             await self._handle_absolute_move(body, username, password)
             return responses.simple_response("tptz", "AbsoluteMove")
 
         elif action == "Stop":
-            self._cancel_action()
-            await self.api.ptz_control(username, password, "Stop")
+            self._cancel_action(reason="ONVIF Stop")
+            await self.api.ptz_control(username, password, "Stop", channel=self.config.channel or 0)
             self.state.move_status = self.state.move_status.IDLE
             return responses.simple_response("tptz", "Stop")
 
         elif action == "GotoPreset":
-            self._cancel_action()
+            self._cancel_action(reason="GotoPreset")
             await self._handle_goto_preset(body, username, password)
             return responses.simple_response("tptz", "GotoPreset")
 
@@ -336,7 +337,7 @@ class ONVIFServer:
             token_el = action_el.find(f"{{{PTZ_NS}}}PresetToken")
             if token_el is not None and token_el.text:
                 preset_id = int(token_el.text)
-                await self.api.remove_preset(username, password, preset_id)
+                await self.api.remove_preset(username, password, preset_id, channel=self.config.channel or 0)
                 logger.info("Camera %s: RemovePreset id=%d", self.config.name, preset_id)
             return responses.simple_response("tptz", "RemovePreset")
 
@@ -367,10 +368,10 @@ class ONVIFServer:
 
         op, speed = continuous_move_to_op(pan_vel, tilt_vel, zoom_vel)
         if op != "Stop":
-            await self.api.ptz_control(username, password, op, speed)
+            await self.api.ptz_control(username, password, op, speed, channel=self.config.channel or 0)
             self.state.mark_moving()
         else:
-            await self.api.ptz_control(username, password, "Stop")
+            await self.api.ptz_control(username, password, "Stop", channel=self.config.channel or 0)
 
     async def _handle_relative_move(self, body: etree._Element, username: str, password: str):
         """Handle RelativeMove — use Set3DPos if available, otherwise position-feedback."""
@@ -415,21 +416,38 @@ class ONVIFServer:
             self._start_action(self._relative_move_3d(pan, tilt, zoom, speed, username, password))
             return
 
-        self._start_action(self._relative_move_feedback(pan, tilt, zoom, username, password))
+        if self.api.nvr_mode:
+            # A second click/drag may arrive while the first is still moving.
+            # Do not cancel the earlier movement (including its zoom settling).
+            self._queue_action(
+                lambda: self._relative_move_feedback(pan, tilt, zoom, username, password)
+            )
+        else:
+            self._start_action(self._relative_move_feedback(pan, tilt, zoom, username, password))
 
     async def _relative_move_feedback(
         self, pan: float, tilt: float, zoom: float, username: str, password: str
     ):
         """No Set3DPos: closed-loop ContinuousMove for pan/tilt, then the zoom step."""
-        zf = await self.api.get_zoom_focus(username, password)
+        zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
         start_step = zf.zoom_pos
         mag = self._zoom_curve(zf).magnification(start_step) if zf.zoom_max > zf.zoom_min else 1.0
+        logger.info(
+            "Camera %s: RelativeMove feedback zoom_step=%d range=%d..%d "
+            "magnification=%.3f pan_units=%.1f tilt_units=%.1f",
+            self.config.name, start_step, zf.zoom_min, zf.zoom_max,
+            mag, self.config.fov_pan_units / mag, self.config.fov_tilt_units / mag,
+        )
         await self.api.relative_move_feedback(
             username=username, password=password,
             pan=pan, tilt=tilt,
             pan_units=self.config.fov_pan_units / mag,
             tilt_units=self.config.fov_tilt_units / mag,
             move_speed=self.config.move_speed,
+            channel=self.config.channel or 0,
+            nvr_pulse_ms=(self.config.nvr_pulse_ms
+                          if self.config.nvr_move_mode == "timed_pulse" and self.api.nvr_mode
+                          else None),
         )
         target_step = self._zoom_target(zf, start_step, zoom)
         if target_step != start_step:
@@ -437,7 +455,7 @@ class ONVIFServer:
                 "Camera %s: zoom %d -> %d (requested %.3f)",
                 self.config.name, start_step, target_step, zoom,
             )
-            await self.api.set_zoom(username, password, target_step)
+            await self.api.set_zoom(username, password, target_step, channel=self.config.channel or 0)
             await self._wait_until_settled(username, password)
 
     async def _relative_move_3d(
@@ -450,10 +468,10 @@ class ONVIFServer:
         a lake_view-class camera), and shrunken boxes for left/up targets zoom
         in as a side effect. So the zoom step is always set explicitly after.
         """
-        zf = await self.api.get_zoom_focus(username, password)
+        zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
         start_step = zf.zoom_pos
 
-        resolution = await self.api.get_stream_resolution(username, password)
+        resolution = await self.api.get_stream_resolution(username, password, channel=self.config.channel or 0)
         box = center_box(pan, tilt, resolution.width, resolution.height, speed)
         if box is not None:
             logger.info(
@@ -461,13 +479,16 @@ class ONVIFServer:
                 self.config.name, box.pos_x, box.pos_y,
                 box.pos_width, box.pos_height, box.width, box.height,
             )
-            await self.api.set_3d_pos(
+            success = await self.api.set_3d_pos(
                 username=username, password=password,
                 pos_x=box.pos_x, pos_y=box.pos_y,
                 pos_width=box.pos_width, pos_height=box.pos_height,
                 stream_width=box.width, stream_height=box.height,
                 speed=box.speed,
+                channel=self.config.channel or 0,
             )
+            if not success:
+                raise RuntimeError("Set3DPos rejected by NVR; cannot calibrate FOV-relative movement")
             zf = await self._wait_until_settled(username, password)
 
         target_step = self._zoom_target(zf, start_step, zoom)
@@ -476,7 +497,7 @@ class ONVIFServer:
                 "Camera %s: zoom %d -> %d (requested %.3f)",
                 self.config.name, zf.zoom_pos, target_step, zoom,
             )
-            await self.api.set_zoom(username, password, target_step)
+            await self.api.set_zoom(username, password, target_step, channel=self.config.channel or 0)
             await self._wait_until_settled(username, password)
 
     def _zoom_target(self, zf: ZoomFocus, start_step: int, zoom: float) -> int:
@@ -504,8 +525,8 @@ class ONVIFServer:
         zf = ZoomFocus()
         while time.monotonic() < deadline:
             await asyncio.sleep(0.3)
-            pos = await self.api.get_position(username, password)
-            zf = await self.api.get_zoom_focus(username, password)
+            pos = await self.api.get_position(username, password, channel=self.config.channel or 0)
+            zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
             current = (pos.pan, pos.tilt, zf.zoom_pos)
             stable = stable + 1 if current == last else 0
             last = current
@@ -515,23 +536,70 @@ class ONVIFServer:
         return zf
 
     def _start_action(self, coro):
-        self._cancel_action()
+        self._cancel_action(reason="new standalone action")
         self.state.begin_action()
         task = asyncio.create_task(coro)
         self._action_task = task
+        self._action_tasks.add(task)
+        logger.info("Camera %s: PTZ action started task=%s", self.config.name, task.get_name())
+        task.add_done_callback(self._action_done)
+
+    def _queue_action(self, coro_factory):
+        """Serialize NVR RelativeMove requests; don't lose rapid drag-to-zoom."""
+        previous = self._action_task
+        if previous is None or previous.done():
+            self._start_action(coro_factory())
+            return
+
+        async def run_after_previous():
+            logger.info("Camera %s: queued RelativeMove waiting for task=%s",
+                        self.config.name, previous.get_name())
+            try:
+                await previous
+            except asyncio.CancelledError:
+                logger.warning("Camera %s: queued RelativeMove aborted: prior task cancelled",
+                               self.config.name)
+                raise
+            except Exception:
+                # Previous exception is logged by its task's done callback.
+                pass
+            logger.info("Camera %s: queued RelativeMove starting after task=%s",
+                        self.config.name, previous.get_name())
+            await coro_factory()
+
+        logger.info("Camera %s: queueing RelativeMove until current move finishes",
+                    self.config.name)
+        self.state.begin_action()
+        task = asyncio.create_task(run_after_previous())
+        self._action_task = task
+        self._action_tasks.add(task)
         task.add_done_callback(self._action_done)
 
     def _action_done(self, task: asyncio.Task):
+        self._action_tasks.discard(task)
+        if task.cancelled():
+            logger.warning("Camera %s: PTZ action cancelled task=%s",
+                           self.config.name, task.get_name())
+        elif task.exception() is not None:
+            logger.error("Camera %s: move failed: %s",
+                         self.config.name, task.exception())
+        else:
+            logger.info("Camera %s: PTZ action completed task=%s",
+                        self.config.name, task.get_name())
         if self._action_task is task:
             self._action_task = None
-            self.state.end_action()
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Camera %s: move failed: %s", self.config.name, task.exception())
+            if not self._action_tasks:
+                self.state.end_action()
 
-    def _cancel_action(self):
-        task, self._action_task = self._action_task, None
-        if task is not None and not task.done():
+    def _cancel_action(self, reason: str = "unspecified"):
+        pending = tuple(task for task in self._action_tasks if not task.done())
+        if pending:
+            logger.warning("Camera %s: cancelling %d PTZ action(s), reason=%s",
+                           self.config.name, len(pending), reason)
+        for task in pending:
             task.cancel()
+        self._action_tasks.clear()
+        self._action_task = None
         self.state.busy = False
 
     async def _handle_absolute_move(self, body: etree._Element, username: str, password: str):
@@ -541,9 +609,9 @@ class ONVIFServer:
 
         if zoom_el is not None:
             zoom_value = float(zoom_el.get("x", "0"))
-            zf = await self.api.get_zoom_focus(username, password)
+            zf = await self.api.get_zoom_focus(username, password, channel=self.config.channel or 0)
             zoom_pos = absolute_zoom_to_position(zoom_value, zf.zoom_min, zf.zoom_max)
-            await self.api.set_zoom(username, password, zoom_pos)
+            await self.api.set_zoom(username, password, zoom_pos, channel=self.config.channel or 0)
             self.state.mark_moving()
         else:
             # Pan/tilt absolute not supported
@@ -555,7 +623,7 @@ class ONVIFServer:
         token_el = action_el.find(f"{{{PTZ_NS}}}PresetToken")
         if token_el is not None and token_el.text:
             preset_id = int(token_el.text)
-            await self.api.goto_preset(username, password, preset_id)
+            await self.api.goto_preset(username, password, preset_id, channel=self.config.channel or 0)
             self.state.mark_moving()
 
     async def _handle_set_preset(self, body: etree._Element, username: str, password: str) -> str:
@@ -571,13 +639,13 @@ class ONVIFServer:
             preset_id = int(token_el.text)
         else:
             # Create new preset — find lowest unused ID
-            existing = await self.api.get_presets(username, password)
+            existing = await self.api.get_presets(username, password, channel=self.config.channel or 0)
             used_ids = {int(p["token"]) for p in existing}
             preset_id = next(i for i in range(1, 65) if i not in used_ids)
 
         if name is None:
             name = f"Preset {preset_id}"
 
-        await self.api.set_preset(username, password, preset_id, name)
+        await self.api.set_preset(username, password, preset_id, name, channel=self.config.channel or 0)
         logger.info("Camera %s: SetPreset id=%d name='%s'", self.config.name, preset_id, name)
         return str(preset_id)
