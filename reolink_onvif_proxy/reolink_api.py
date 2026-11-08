@@ -426,6 +426,17 @@ class ReolinkAPI:
                 if not self._has_tilt:
                     raise RuntimeError("Tilt feedback unavailable")
                 ops = ("Up", "Down") if amount > 0 else ("Down", "Up")
+                if self.nvr_mode and ops[0] == "Up":
+                    current_tilt = await self._axis_position(
+                        username, password, "tilt", channel
+                    )
+                    if current_tilt == 0:
+                        logger.info(
+                            "Camera %s: skipping NVR tilt Up: already at upper limit "
+                            "(Tpos=0, requested=%.1f units)",
+                            self.host, distance,
+                        )
+                        continue
             await self._move_axis(
                 username, password, axis, ops, distance, tolerance, move_speed, channel
             )
