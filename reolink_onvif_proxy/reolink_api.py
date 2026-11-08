@@ -36,9 +36,10 @@ class StreamResolution:
 class ReolinkAPI:
     """Client for Reolink camera using reolink_aio (Baichuan protocol)."""
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, nvr_mode: bool = False):
         self.host = host
         self.port = port
+        self.nvr_mode = nvr_mode
         self._api: Host | None = None
         self._logged_in = False
         self._stream_resolution: StreamResolution | None = None
@@ -93,8 +94,18 @@ class ReolinkAPI:
             except Exception:
                 self._supports_3d_pos = False
 
-        # Baichuan always reports both Ppos and Tpos
-        self._has_tilt = True
+        # NVR HTTP responses may report only Ppos. Do not assume tilt
+        # feedback exists until it is observed.
+        if self.nvr_mode:
+            result = await api.send(
+                [{"cmd": "GetPtzCurPos", "action": 0,
+                  "param": {"PtzCurPos": {"channel": channel}}}],
+                expected_response_type="json",
+            )
+            value = (result[0].get("value") or {}).get("PtzCurPos", {}) if result else {}
+            self._has_tilt = result[0].get("code") == 0 and "Tpos" in value if result else False
+        else:
+            self._has_tilt = True
 
         logger.info(
             "Camera %s capabilities: Set3DPos=%s, has_tilt=%s",
@@ -113,8 +124,16 @@ class ReolinkAPI:
         """Get current PTZ pan/tilt position via Baichuan."""
         try:
             api = await self._ensure_connected(username, password)
-            pan = api.ptz_pan_position(channel)
-            tilt = api.ptz_tilt_position(channel)
+            if self.nvr_mode:
+                result = await api.send(
+                    [{"cmd": "GetPtzCurPos", "action": 0,
+                      "param": {"PtzCurPos": {"channel": channel}}}],
+                    expected_response_type="json",
+                )
+                if not result or result[0].get("code") != 0:
+                    raise ValueError(f"GetPtzCurPos failed: {result}")
+                pos = result[0]["value"]["PtzCurPos"]
+                return PtzPosition(pan=pos.get("Ppos", 0), tilt=pos.get("Tpos", 0))
             # Refresh position data
             await api.get_states(cmd_list={"GetPtzCurPos": {channel: 1}})
             pan = api.ptz_pan_position(channel) or 0
@@ -244,6 +263,13 @@ class ReolinkAPI:
         """Send a PTZ control command."""
         api = await self._ensure_connected(username, password)
         try:
+            if self.nvr_mode:
+                result = await api.send(
+                    [{"cmd": "PtzCtrl", "action": 0,
+                      "param": {"channel": channel, "op": op, "speed": speed}}],
+                    expected_response_type="json",
+                )
+                return bool(result and result[0].get("code") == 0)
             if self._supports_ptz_speed:
                 await api.set_ptz_command(channel, command=op, speed=speed)
             else:
