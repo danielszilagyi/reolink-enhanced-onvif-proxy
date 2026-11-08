@@ -11,6 +11,8 @@ class CameraConfig:
     name: str
     host: str
     port: int = 80
+    # NVR channel index (zero-based); omit for a directly connected camera.
+    channel: int | None = None
     listen_port: int = 8000
     username: str = ""
     password: str = ""
@@ -46,6 +48,7 @@ def load_config(path: str | Path) -> ProxyConfig:
                 name=cam["name"],
                 host=cam["host"],
                 port=cam.get("port", 80),
+                channel=cam.get("channel"),
                 listen_port=cam["listen_port"],
                 username=cam.get("username", ""),
                 password=cam.get("password", ""),
@@ -61,6 +64,10 @@ def load_config(path: str | Path) -> ProxyConfig:
 
     if not cameras:
         raise ValueError("No cameras configured")
+
+    for camera in cameras:
+        if camera.channel is not None and (type(camera.channel) is not int or camera.channel < 0):
+            raise ValueError(f"Camera {camera.name}: channel must be a non-negative integer")
 
     # Check for duplicate listen ports
     ports = [c.listen_port for c in cameras]
