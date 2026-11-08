@@ -103,10 +103,18 @@ cameras:
     password: your_password
 ```
 
-The NVR-specific PTZ position request uses `param.PtzCurPos.channel`.
-Some NVRs report pan (`Ppos`) without tilt (`Tpos`), limiting the
-position-feedback fallback. `Set3DPos` availability must be verified on your
-specific NVR and camera before relying on Frigate autotracking.
+For RLN36 NVRs, relative pan/tilt movement uses Baichuan command 433
+for both `Ppos` and `Tpos` feedback, plus channel-specific `PtzCtrl`.
+The NVR's `Set3DPos` reports `rspCode: -4` despite capability
+advertisement and is disabled in NVR mode. Relative movement is bounded to
+short commands and sends `Stop` on errors or cancellation.
+
+**Test with a clear camera path and autotracking disabled first.**
+The movement calibration (`fov_pan_units` and `fov_tilt_units`) is
+camera-specific and has not yet been calibrated against the physical RLN36
+setup. Review the movement direction and magnitude using small relative
+commands before enabling Frigate autotracking.
+
 RTSP video can continue to come from the NVR unchanged.
 
 ## Frigate Configuration
