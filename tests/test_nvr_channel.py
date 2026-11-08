@@ -258,10 +258,13 @@ def test_timed_pulse_invalid_config_rejected(tmp_path):
     from reolink_onvif_proxy.config import load_config
 
     cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "cameras:\\n  - name: test\\n    host: 192.0.2.20\\n"
-        "    channel: 8\\n    listen_port: 8001\\n"
-        "    nvr_move_mode: timed_pulse\\n    nvr_pulse_ms: 10\\n"
-    )
+    cfg.write_text("""cameras:
+  - name: test
+    host: 192.0.2.20
+    channel: 8
+    listen_port: 8001
+    nvr_move_mode: timed_pulse
+    nvr_pulse_ms: 10
+""")
     with pytest.raises(ValueError, match="nvr_pulse_ms"):
         load_config(cfg)
